@@ -1,0 +1,467 @@
+#!/usr/bin/python
+
+#
+# Copyright (C) 2009-2011 CJSC TrueOffice (www.trueoffice.ru)
+# Written by Dmitry Stolyarov <dmitry.stolyarov@trueoffice.ru>
+#
+
+# -*- coding: utf-8 -*-
+
+import yaml, os, sys, subprocess, re
+from optparse import OptionParser
+
+class IPM:
+  objtypes_order = ['addr', 'route']
+
+  def __init__(self, filename):
+    try:
+      self.null = file('/dev/null', 'w+')
+    except:
+      print 'Error: Failed to open /dev/null'
+      sys.exit(1)
+ 
+    if not os.path.isfile(filename):
+      print 'Error: Bad conf file "%s": No such file' % filename
+      sys.exit(1)
+
+    with file(filename, 'r') as stream:
+      try:
+        self.data = yaml.load(stream)
+      except:
+        print 'Error: Bad conf file "%s": Failed to parse' % filename
+        sys.exit(1)
+
+    # base check
+    if not isinstance(self.data, dict):
+      print 'Error: Bad conf file "%s": Bad structure' % filename
+      sys.exit(1)
+
+    # config section and state_dir param
+    if not self.data.has_key('config') or not isinstance(self.data['config'], dict):
+      print 'Error: Bad conf file "%s": No "config" section' % filename
+      sys.exit(1)
+    if not self.data['config'].has_key('state_dir'):
+      print 'Error: Bad conf file "%s": No "state_dir" param' % filename
+      sys.exit(1)
+    if not os.path.isdir(self.data['config']['state_dir']):
+      print 'Error: State dir does not exist'
+      sys.exit(1)
+
+    # check interfaces
+    for dev, if_conf in self.data['interfaces'].items():
+      if not isinstance(if_conf, dict):
+        print 'Error: Bad conf file "%s": Bad config for interface "%s", ignoring them' % (filename, dev)
+        self.data['interfaces'].pop(dev)
+        continue
+
+      if len(if_conf) <= 0:
+        self.data['interfaces'].pop(dev)
+        continue
+
+      for objtype, items in if_conf.items():
+        if items == None:
+          self.data['interfaces'][dev].pop(objtype)
+          continue
+        if not isinstance(items, list):
+          print 'Error: Bad conf file "%s": Bad config for interface "%s": Bad config for objtype "%s", ignoring them' % (filename, dev, objtype)
+          self.data['interfaces'][dev].pop(objtype)
+          continue
+
+        for item in items:
+          if not isinstance(item, str):
+            print 'Error: Bad conf file "%s": Bad config for interface "%s": Bad config for objtype "%s": One of the items is bad, ignoring them' % (filename, dev, objtype)
+            self.data['interfaces'][dev][objtype].remove(item)
+            continue
+          if objtype == 'addr' and self._extract_addr(item) == False:
+            print 'Error: Bad conf file "%s": Bad config for interface "%s": Bad config for objtype "%s": Failed to extract addr from item "%s", ignoring them' % (filename, dev, objtype, item)
+            self.data['interfaces'][dev][objtype].remove(item)
+            continue
+           
+
+
+  def up(self, dev):
+    if os.path.isfile(self._if_state_filename(dev)):
+      return True
+
+    print 'Configuring interface %s:' % dev
+
+    if_conf = self._if_conf(dev)
+    if not if_conf:
+      print ' = Error: No such interface (in conf file)'
+      return False
+
+    r, ok_objtypes = self._do(dev, 'add', if_conf)
+
+    if r:
+      with file(self._if_state_filename(dev), 'w') as stream:
+        yaml.dump(if_conf, stream)
+    else:
+      if_state = {}
+      for objtype, items in ok_objtypes:
+        if_state[objtype] = []
+        for item in items:
+          if_state[objtype].append(item)
+        if not len(if_state[objtype]):
+          if_state.pop(objtype)
+        if len(if_state):
+          with file(self._if_state_filename(dev), 'w') as stream:
+            yaml.dump(if_state, stream)
+
+    print ' = %s' % 'Done' if r else 'Failed'
+    print
+
+    return r
+
+  def down(self, dev):
+    if_state = self._if_state(dev)
+    if not if_state: return True
+
+    print 'Deconfiguring interface %s:' % dev
+
+    r, ok_objtypes = self._do(dev, 'delete', if_state)
+ 
+    if r:
+      os.unlink(self._if_state_filename(dev))
+    else:
+      for objtype, items in ok_objtypes:
+        for item in items:
+          if_state[objtype].remove(item)
+        if not len(if_state[objtype]):
+          if_state.pop(objtype)
+      with file(self._if_state_filename(dev), 'w') as stream:
+        yaml.dump(if_state, stream)
+
+    print ' = %s' % 'Done' if r else 'Failed'
+    print
+
+    return r
+
+  def reload(self, dev):
+    if self.down(dev):
+      self.up(dev)
+
+  def update(self, dev):
+    print 'Updating interface %s:' % dev,
+    has_to_delete = has_to_add = False
+
+    if_state = self._if_state(dev)
+    if not if_state: if_state = {}
+
+    if_conf = self._if_conf(dev)
+    if not if_conf:
+      if not len(if_state):
+        print
+        print ' = Error: No such interface (both in conf and in state)'
+        return False
+      if_conf = {}
+
+    # delete old routes
+    # delete old addr
+    if_tmp = {}
+    for objtype, items in if_state.items():
+      if_tmp[objtype] = []
+      for item in items:
+        if if_conf.has_key(objtype) and if_conf[objtype].count(item): continue
+        if_tmp[objtype].append(item)
+        has_to_delete = True
+    
+    if has_to_delete: print
+
+    r_delete, ok_objtypes = self._do(dev, 'delete', if_tmp)
+    for objtype, items in ok_objtypes:
+      for item in items:
+        if_state[objtype].remove(item)
+      if not len(if_state[objtype]):
+        if_state.pop(objtype)
+
+    # add new rotutes
+    # add new addr
+    if_tmp = {}
+    for objtype, items in if_conf.items():
+      if_tmp[objtype] = []
+      for item in items:
+        if if_state.has_key(objtype) and if_state[objtype].count(item): continue
+        if_tmp[objtype].append(item)
+        has_to_add = True
+    if not has_to_delete and has_to_add: print
+    r_add, ok_objtypes = self._do(dev, 'add', if_tmp)
+    for objtype, items in ok_objtypes:
+      if not if_state.has_key(objtype):
+        if_state[objtype] = []
+      for item in items:
+        if_state[objtype].append(item)
+      if not len(if_state[objtype]):
+        if_state.pop(objtype)
+
+    if len(if_state) > 0:
+      with file(self._if_state_filename(dev), 'w') as stream:
+        yaml.dump(if_state, stream)
+    else:
+      if os.path.isfile(self._if_state_filename(dev)):
+        os.unlink(self._if_state_filename(dev))
+
+    if has_to_add or has_to_delete:
+      print ' = %s' % 'Done' if r_add and r_delete else 'Failed'
+      print
+    else:
+      print 'No changes'
+
+    return r_add and r_delete;
+
+  def status(self, dev):
+    print '%s:' % dev
+
+    if_state = self._if_state(dev)
+    if not if_state:
+      print ' = Error: Interface is not up!'
+      return False
+
+    r = True
+    for objtype, items in if_state.items():
+      for item in items:
+        lr = self._do_status(dev, objtype, item)
+        if not lr: r = False
+        print ' * %s %s: %s' % (objtype, item, 'Ok' if lr else 'Bad')
+    print ' = %s' % 'Ok' if r else 'Bad'
+
+    return r
+
+  def zap(self, dev):
+    if os.path.isfile(self._if_state_filename(dev)):
+      return os.unlink(self._if_state_filename(dev))
+
+  def up_all(self):
+    r = True
+    for dev in self._list_in_conf():
+      if not self.up(dev): r = False
+    return r
+
+  def down_all(self):
+    r = True
+    for dev in self._list_configured():
+      if not self.down(dev): r = False
+    return r
+
+  def reload_all(self):
+    r = True
+    for dev in self._list_configured():
+      if not self.reload(dev): r = False
+    if not self.up_all(): r = False
+    return r
+
+  def update_all(self):
+    r = True
+    for dev in self._list_all():
+      if not self.update(dev): r = False
+    return r
+
+  def status_all(self):
+    r = True
+    for dev in self._list_configured():
+      if not self.status(dev): r = False
+    return r
+
+  def zap_all(self):
+    r = True
+    for dev in self._list_configured():
+      if not self.zap(dev): r = False
+    return r
+
+  def _if_state_filename(self, dev):
+    return self.data['config']['state_dir'] + '/' + dev
+
+  def _if_conf(self, dev):
+    if dev in self.data['interfaces']:
+      return self.data['interfaces'][dev]
+    return None
+
+  def _if_state(self, dev):
+    if not os.path.isfile(self._if_state_filename(dev)): return False
+    with file(self._if_state_filename(dev), 'r') as stream:
+      try:
+        if_state = yaml.load(stream)
+      except:
+        print 'Error: Bad state file "%s", removing them' % self._if_state_filename(dev)
+        os.unlink(self._if_state_filename(dev))
+        return False
+
+    if len(if_state) <= 0:
+      os.unlink(self._if_state_filename(dev))
+      if_state = False
+
+    return if_state
+
+  def _do(self, dev, action, if_conf):
+    r = True
+    ok_objtypes = []
+    for objtype in self.__class__.objtypes_order if action == 'add' else reversed(self.__class__.objtypes_order):
+      if objtype not in if_conf: continue
+      lr, ok_items = self._do_one(dev, action, objtype, if_conf[objtype] if action == 'add' else reversed(if_conf[objtype]))
+      if not lr: r = False
+      ok_objtypes.append((objtype, ok_items))
+    return r, ok_objtypes
+
+  def _do_one(self, dev, action, objtype, items):
+    # action = add or delete
+    # objtype = addr or route
+
+    r = True
+    ok_items = []
+    for item in items:
+      # check status before
+      precheck = True
+      if action == 'add' and self._do_status(dev, objtype, item) == True:
+        precheck = False
+        lr = False
+      elif action == 'delete' and self._do_status(dev, objtype, item) == False:
+        ok_items.append(item)
+        precheck = False
+        lr = True
+
+      # do-do-do!
+      if precheck:
+        command = '/sbin/ip %s %s dev %s %s' % (objtype, action, dev, item)
+        lr = not subprocess.call(command, shell=True, stdin=self.null, stdout=self.null, stderr=self.null)
+        if lr and action == 'add' and objtype == 'addr':
+          lr &= not subprocess.call('/usr/bin/arping -c 1 -U -I %s %s' % (dev, self._extract_addr(item)), shell=True, stdin=self.null, stdout=self.null, stderr=self.null)
+
+      # check status after
+      if lr:
+        if action == 'add' and self._do_status(dev, objtype, item) == False:
+          command = '/sbin/ip %s %s dev %s %s' % (objtype, self._antiaction(action), dev, item)
+          subprocess.call(command, shell=True, stdin=self.null, stdout=self.null, stderr=self.null)
+          lr = False
+        elif action == 'delete' and self._do_status(dev, objtype, item) == True:
+          lr = False
+
+      print ' * %s %s %s: %s' % (action, objtype, item, 'Done' if lr else 'Failed')
+
+      if not lr: r = False
+      else: ok_items.append(item)
+
+    return r, ok_items
+
+  def _antiaction(self, action):
+    if action == 'add': return 'delete'
+    elif action == 'delete': return 'add'
+    return False
+
+  def _do_status(self, dev, objtype, item):
+    if objtype == 'route':
+      return self._status_route(dev, item)
+    elif objtype == 'addr': 
+      return self._status_addr(dev, item);
+    else:
+      return False
+
+  def _status_route(self, dev, item):
+    command = '/usr/bin/test `/sbin/ip route show dev %s %s | /usr/bin/wc -l` -eq 1' % (dev, item)
+    return not subprocess.call(command, shell=True, stdin=self.null, stdout=self.null, stderr=self.null)
+
+  def _status_addr(self, dev, item):
+    command = '/usr/bin/test `/sbin/ip addr show dev %s | grep \'%s\' | /usr/bin/wc -l` -eq 1' %  (dev, self._extract_addr(item))
+    return not subprocess.call(command, shell=True, stdin=self.null, stdout=self.null, stderr=self.null)
+
+  def _list_in_conf(self):
+    devs = self.data['interfaces'].keys()
+    devs.sort()
+    return devs
+
+  def _list_configured(self):
+    devs = os.listdir(self.data['config']['state_dir']) 
+    devs.sort()
+    return devs
+
+  def _list_all(self):
+    devs = list(set(os.listdir(self.data['config']['state_dir']) + self.data['interfaces'].keys()))
+    devs.sort()
+    return devs
+
+  def _extract_addr(self, string):
+    addrs = []
+    for word, addr in re.findall('(^ ?|\w+ )([\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3})', string):
+      word = word.strip()
+      if word in ['broadcast', 'brd', 'bcast', 'anycast', 'peer']: continue
+      addrs.append(addr)
+    if len(addrs) != 1: return False
+    return addrs.pop()
+
+def print_help():
+  print """Usage: ipm [-c CONFIG] ACTION [IF | --all]
+
+Do action for one interface:
+ ipm [-c CONFIG] ACTION IF
+ ipm [-c CONFIG] IF ACTION
+  
+Do action for all interfaces:
+ ipm [-c CONFIG] ACTION --all
+
+Show status for one or all interfaces:
+ ipm [-c CONFIG] IF
+ ipm [-c CONFIG] --all
+
+IF: NIC interface name (eth0, valn5, ...)
+
+ACTIONs: up, down, reload, update, status, zap
+
+CONF (one of):
+ full path to conf file or
+ file in /etc/ipm (with or without extension)
+
+Copyright (C) 2009-2011 CJSC TrueOffice (www.trueoffice.ru)
+"""
+
+actions = ['up', 'down', 'reload', 'update', 'status', 'zap']
+parser = OptionParser(add_help_option = False, usage = 'ipm [-c CONFIG] ACTION [IF | --all]')
+parser.print_help = print_help
+parser.add_option('--help', action = 'help')
+parser.add_option('--all', action = 'store_true', default = False)
+parser.add_option('-c', '--config', default='main')
+
+options, args = parser.parse_args()
+
+if os.geteuid() != 0: parser.error('you should be root')
+
+if options.all:
+  if len(args) == 0: parser.error('no action given')
+  elif len(args) > 1: parser.error('to many args')
+  action = args[0]
+  if not action in actions: parser.error('unknown action')  
+else:
+  if len(args) < 2: parser.error('no action and/or iface given')
+  elif len(args) > 2: parser.error('to many args')
+  action, dev = args[0], args[1]
+  if dev in actions: action, dev = dev, action
+  if not action in actions: parser.error('unknown action')
+
+if os.path.isfile(options.config):
+  conf = options.config
+elif os.path.isfile(options.config + '.yaml'):
+  conf = options.config + '.yaml'
+elif os.path.isfile('/etc/ipm/' + options.config):
+  conf = '/etc/ipm/' + options.config
+elif os.path.isfile('/etc/ipm/' + options.config + '.yaml'):
+  conf = '/etc/ipm/' + options.config + '.yaml'
+else:
+  parser.error('no such config')
+
+ipm = IPM(conf)
+
+if options.all:
+  if action == 'up': r = ipm.up_all()
+  elif action == 'down': r = ipm.down_all()
+  elif action == 'reload': r = ipm.reload_all()
+  elif action == 'update': r = ipm.update_all()
+  elif action == 'status': r = ipm.status_all()
+  elif action == 'zap': r = ipm.zap_all()
+  sys.exit(r)
+  
+else:
+  if action == 'up': r = ipm.up(dev)
+  elif action == 'down': r = ipm.down(dev)
+  elif action == 'reload': r = ipm.reload(dev)
+  elif action == 'update': r = ipm.update(dev)
+  elif action == 'status': r = ipm.status(dev)
+  elif action == 'zap': r = ipm.zap(dev)
+  sys.exit(r)
+
