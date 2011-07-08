@@ -359,7 +359,7 @@ class IPM:
     return not subprocess.call(command, shell=True, stdin=self.null, stdout=self.null, stderr=self.null)
 
   def _status_addr(self, dev, item):
-    command = '/usr/bin/test `/sbin/ip addr show dev %s | grep \'%s\' | /usr/bin/wc -l` -eq 1' %  (dev, self._extract_addr(item))
+    command = '/usr/bin/test `/sbin/ip addr show dev %s | grep \'%s/\' | /usr/bin/wc -l` -eq 1' %  (dev, self._extract_addr(item))
     return not subprocess.call(command, shell=True, stdin=self.null, stdout=self.null, stderr=self.null)
 
   def _list_in_conf(self):
@@ -454,7 +454,7 @@ if options.all:
   elif action == 'update': r = ipm.update_all()
   elif action == 'status': r = ipm.status_all()
   elif action == 'zap': r = ipm.zap_all()
-  sys.exit(r)
+  sys.exit(not r)
   
 else:
   if action == 'up': r = ipm.up(dev)
@@ -463,5 +463,5 @@ else:
   elif action == 'update': r = ipm.update(dev)
   elif action == 'status': r = ipm.status(dev)
   elif action == 'zap': r = ipm.zap(dev)
-  sys.exit(r)
+  sys.exit(not r)
 
