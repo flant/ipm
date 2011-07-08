@@ -27,8 +27,8 @@ class IPM:
     with file(filename, 'r') as stream:
       try:
         self.data = yaml.load(stream)
-      except:
-        print 'Error: Bad conf file "%s": Failed to parse' % filename
+      except yaml.YAMLError, exc:
+        print ('Error: Bad conf file "%s": Failed to parse:' % filename), exc
         sys.exit(1)
 
     # base check
