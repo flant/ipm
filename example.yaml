@@ -1,5 +1,6 @@
 config:
   state_dir: /tmp/imp_example
+  concurrency: 4
 
 interfaces:
   eth0:

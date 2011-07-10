@@ -7,8 +7,9 @@
 
 # -*- coding: utf-8 -*-
 
-import yaml, os, sys, subprocess, re
+import yaml, os, sys, subprocess, re, Queue, threading
 from optparse import OptionParser
+from lockfile import FileLock
 
 class IPM:
   objtypes_order = ['addr', 'route']
@@ -44,8 +45,11 @@ class IPM:
       print 'Error: Bad conf file "%s": No "state_dir" param' % filename
       sys.exit(1)
     if not os.path.isdir(self.data['config']['state_dir']):
-      print 'Error: State dir does not exist'
-      sys.exit(1)
+      try:
+        os.makedirs(self.data['config']['state_dir'], 0755)
+      except:
+        print 'Error: State dir does not exist and mkdir failed'
+        sys.exit(1)
 
     # check interfaces
     for dev, if_conf in self.data['interfaces'].items():
@@ -76,19 +80,35 @@ class IPM:
             print 'Error: Bad conf file "%s": Bad config for interface "%s": Bad config for objtype "%s": Failed to extract addr from item "%s", ignoring them' % (filename, dev, objtype, item)
             self.data['interfaces'][dev][objtype].remove(item)
             continue
-           
 
+    # file lock
+    if not os.path.isdir(self.data['config']['state_dir'] + '/.lock'):
+      try:
+        os.makedirs(self.data['config']['state_dir'] + '/.lock', 0755)
+      except:
+        print 'Error: Failed to create lock dir %s' % self.data['config']['state_dir'] + '/.lock'
+        sys.exit(1)
+    self.filelock = FileLock(self.data['config']['state_dir'] + '/.lock/ipm')
+
+    # threading
+    self.thlocal = threading.local()
+    if not self.data['config'].has_key('concurrency'):
+      self.concurrency = 1
+    else:
+      self.concurrency = self.data['config']['concurrency']
 
   def up(self, dev):
     if os.path.isfile(self._if_state_filename(dev)):
-      return True
+      return True, ''
 
-    print 'Configuring interface %s:' % dev
+    buf = self._buffer()
+
+    print >> buf, 'Configuring interface %s:' % dev
 
     if_conf = self._if_conf(dev)
     if not if_conf:
-      print ' = Error: No such interface (in conf file)'
-      return False
+      print >> buf, ' = Error: No such interface (in conf file)'
+      return False, buf.data()
 
     r, ok_objtypes = self._do(dev, 'add', if_conf)
 
@@ -107,16 +127,17 @@ class IPM:
           with file(self._if_state_filename(dev), 'w') as stream:
             yaml.dump(if_state, stream)
 
-    print ' = %s' % 'Done' if r else 'Failed'
-    print
+    print >> buf, ' = %s' % ('Done' if r else 'Failed')
 
-    return r
+    return r, buf.data()
 
   def down(self, dev):
     if_state = self._if_state(dev)
-    if not if_state: return True
+    if not if_state: return True, ''
 
-    print 'Deconfiguring interface %s:' % dev
+    buf = self._buffer()
+
+    print >> buf, 'Deconfiguring interface %s:' % dev
 
     r, ok_objtypes = self._do(dev, 'delete', if_state)
  
@@ -131,17 +152,22 @@ class IPM:
       with file(self._if_state_filename(dev), 'w') as stream:
         yaml.dump(if_state, stream)
 
-    print ' = %s' % 'Done' if r else 'Failed'
-    print
+    print >> buf, ' = %s' % ('Done' if r else 'Failed')
 
-    return r
+    return r, buf.data()
 
   def reload(self, dev):
-    if self.down(dev):
-      self.up(dev)
+    r, bufdata = self.down(dev)
+    if r:
+      up_res = self.up(dev)
+      r = r and up_res[0]
+      bufdata = bufdata + up_res[1]
+    return r, bufdata
 
   def update(self, dev):
-    print 'Updating interface %s:' % dev,
+    buf = self._buffer()
+
+    print >> buf, 'Updating interface %s:' % dev,
     has_to_delete = has_to_add = False
 
     if_state = self._if_state(dev)
@@ -150,9 +176,9 @@ class IPM:
     if_conf = self._if_conf(dev)
     if not if_conf:
       if not len(if_state):
-        print
-        print ' = Error: No such interface (both in conf and in state)'
-        return False
+        print >> buf
+        print >> buf, ' = Error: No such interface (both in conf and in state)'
+        return False, buf.data()
       if_conf = {}
 
     # delete old routes
@@ -165,7 +191,7 @@ class IPM:
         if_tmp[objtype].append(item)
         has_to_delete = True
     
-    if has_to_delete: print
+    if has_to_delete: print >> buf
 
     r_delete, ok_objtypes = self._do(dev, 'delete', if_tmp)
     for objtype, items in ok_objtypes:
@@ -183,7 +209,7 @@ class IPM:
         if if_state.has_key(objtype) and if_state[objtype].count(item): continue
         if_tmp[objtype].append(item)
         has_to_add = True
-    if not has_to_delete and has_to_add: print
+    if not has_to_delete and has_to_add: print >> buf
     r_add, ok_objtypes = self._do(dev, 'add', if_tmp)
     for objtype, items in ok_objtypes:
       if not if_state.has_key(objtype):
@@ -201,71 +227,140 @@ class IPM:
         os.unlink(self._if_state_filename(dev))
 
     if has_to_add or has_to_delete:
-      print ' = %s' % 'Done' if r_add and r_delete else 'Failed'
-      print
+      print >> buf, ' = %s' % ('Done' if r_add and r_delete else 'Failed')
     else:
-      print 'No changes'
+      print >> buf, 'No changes'
 
-    return r_add and r_delete;
+    return r_add and r_delete, buf.data()
 
   def status(self, dev):
-    print '%s:' % dev
+    buf = self._buffer()
+
+    print >> buf, '%s:' % dev
 
     if_state = self._if_state(dev)
     if not if_state:
-      print ' = Error: Interface is not up!'
-      return False
+      print >> buf, ' = Error: Interface is not up!'
+      return False, buf.data()
 
     r = True
     for objtype, items in if_state.items():
       for item in items:
         lr = self._do_status(dev, objtype, item)
         if not lr: r = False
-        print ' * %s %s: %s' % (objtype, item, 'Ok' if lr else 'Bad')
-    print ' = %s' % 'Ok' if r else 'Bad'
+        print >> buf, ' * %s %s: %s' % (objtype, item, 'Ok' if lr else 'Bad')
+    print >> buf, ' = %s' % ('Ok' if r else 'Bad')
 
-    return r
+    return r, buf.data()
 
   def zap(self, dev):
     if os.path.isfile(self._if_state_filename(dev)):
-      return os.unlink(self._if_state_filename(dev))
+      return os.unlink(self._if_state_filename(dev)), ''
+    return True, ''
 
   def up_all(self):
-    r = True
+    tm = IMP_Taskman(self.concurrency)
+
+    tm.start()
     for dev in self._list_in_conf():
-      if not self.up(dev): r = False
-    return r
+      tm.add_task(self.up, (dev))
+    results = tm.get_results()
+
+    r = True
+    bufdata = ''
+    for result in results:
+      r = r and result[0]
+      bufdata = bufdata + result[1]
+
+    tm.stop()
+
+    return r, bufdata
+
 
   def down_all(self):
-    r = True
+    tm = IMP_Taskman(self.concurrency)
+
+    tm.start()
     for dev in self._list_configured():
-      if not self.down(dev): r = False
-    return r
+      tm.add_task(self.down, (dev))
+    results = tm.get_results()
+
+    r = True
+    bufdata = ''
+    for result in results:
+      r = r and result[0]
+      bufdata = bufdata + result[1]
+
+    tm.stop()
+
+    return r, bufdata
+
 
   def reload_all(self):
-    r = True
+    tm = IMP_Taskman(self.concurrency)
+
+    tm.start()
     for dev in self._list_configured():
-      if not self.reload(dev): r = False
-    if not self.up_all(): r = False
-    return r
+      tm.add_task(self.reload, (dev))
+    results = tm.get_results()
+
+    r = True
+    bufdata = ''
+    for result in results:
+      r = r and result[0]
+      bufdata = bufdata + result[1]
+
+    tm.stop()
+
+    up_all_res = self.up_all()
+    r = r and up_all_res[0]
+    bufdata = bufdata + up_all_res[1]
+
+    return r, bufdata
+
 
   def update_all(self):
-    r = True
+    tm = IMP_Taskman(self.concurrency)
+
+    tm.start()
     for dev in self._list_all():
-      if not self.update(dev): r = False
-    return r
+      tm.add_task(self.update, (dev))
+    results = tm.get_results()
+
+    r = True
+    bufdata = ''
+    for result in results:
+      r = r and result[0]
+      bufdata = bufdata + result[1]
+
+    tm.stop()
+
+    return r, bufdata
+
 
   def status_all(self):
-    r = True
+    tm = IMP_Taskman(self.concurrency)
+
+    tm.start()
     for dev in self._list_configured():
-      if not self.status(dev): r = False
-    return r
+      tm.add_task(self.status, dev)
+    results = tm.get_results()
+
+    r = True
+    bufdata = ''
+    for result in results:
+      r = r and result[0]
+      bufdata = bufdata + result[1]
+
+    tm.stop()
+
+    return r, bufdata
 
   def zap_all(self):
     r = True
     for dev in self._list_configured():
-      if not self.zap(dev): r = False
-    return r
+      if not self.zap(dev)[0]: r = False
+    return r, ''
 
   def _if_state_filename(self, dev):
     return self.data['config']['state_dir'] + '/' + dev
@@ -276,16 +371,18 @@ class IPM:
     return None
 
   def _if_state(self, dev):
+    buf = self._buffer()
+
     if not os.path.isfile(self._if_state_filename(dev)): return False
     with file(self._if_state_filename(dev), 'r') as stream:
       try:
         if_state = yaml.load(stream)
       except:
-        print 'Error: Bad state file "%s", removing them' % self._if_state_filename(dev)
+        print >> buf, 'Error: Bad state file "%s", removing them' % self._if_state_filename(dev)
         os.unlink(self._if_state_filename(dev))
         return False
 
-    if len(if_state) <= 0:
+    if not isinstance(if_state, dict) or len(if_state) <= 0:
       os.unlink(self._if_state_filename(dev))
       if_state = False
 
@@ -305,6 +402,8 @@ class IPM:
     # action = add or delete
     # objtype = addr or route
 
+    buf = self._buffer()
+
     r = True
     ok_items = []
     for item in items:
@@ -323,7 +422,7 @@ class IPM:
         command = '/sbin/ip %s %s dev %s %s' % (objtype, action, dev, item)
         lr = not subprocess.call(command, shell=True, stdin=self.null, stdout=self.null, stderr=self.null)
         if lr and action == 'add' and objtype == 'addr':
-          lr &= not subprocess.call('/usr/bin/arping -c 1 -U -I %s %s' % (dev, self._extract_addr(item)), shell=True, stdin=self.null, stdout=self.null, stderr=self.null)
+          lr = lr and not subprocess.call('/usr/bin/arping -c 1 -U -I %s %s' % (dev, self._extract_addr(item)), shell=True, stdin=self.null, stdout=self.null, stderr=self.null)
 
       # check status after
       if lr:
@@ -334,7 +433,11 @@ class IPM:
         elif action == 'delete' and self._do_status(dev, objtype, item) == True:
           lr = False
 
-      print ' * %s %s %s: %s' % (action, objtype, item, 'Done' if lr else 'Failed')
+      if lr:
+       if precheck: tr = 'Done'
+       if not precheck: tr = 'Ignored'
+      else: tr = 'Failed'
+      print >> buf, ' * %s %s %s: %s' % (action, objtype, item, tr)
 
       if not lr: r = False
       else: ok_items.append(item)
@@ -370,11 +473,13 @@ class IPM:
   def _list_configured(self):
     devs = os.listdir(self.data['config']['state_dir']) 
     devs.sort()
+    devs.remove('.lock')
     return devs
 
   def _list_all(self):
     devs = list(set(os.listdir(self.data['config']['state_dir']) + self.data['interfaces'].keys()))
     devs.sort()
+    devs.remove('.lock')
     return devs
 
   def _extract_addr(self, string):
@@ -385,6 +490,101 @@ class IPM:
       addrs.append(addr)
     if len(addrs) != 1: return False
     return addrs.pop()
+
+  class Buf:
+    def __init__(self, thlocal, clear = False):
+      self.thlocal = thlocal
+      if 'bufdata' not in dir(self.thlocal):
+        self.thlocal.bufdata = ''
+
+    def write(self, s):
+      self.thlocal.bufdata = self.thlocal.bufdata + s
+
+    def data(self):
+      d = self.thlocal.bufdata
+      self.thlocal.bufdata = ''
+      return d
+
+  def _buffer(self):
+    return IPM.Buf(self.thlocal)
+
+
+class IMP_Taskman:
+  def __init__(self, concurrency, threading_local = None):
+    self.concurrency = concurrency
+
+    if threading_local is None:
+      threading_local = threading.local()
+    self.thlocal = threading_local
+
+    self.stopped = True
+    self.cond = threading.Condition()
+
+    self.tasks = []
+    self.results = []
+    self.unfinished = 0
+    self.all_tasks_done = threading.Event()
+    self.all_tasks_done.set()
+
+    self.threads = []
+
+  def start(self):
+    with self.cond:
+      self.stopped = False
+      for _ in range(0, self.concurrency):
+        thread = threading.Thread(target = self._worker)
+        thread.daemon = True
+        thread.start()
+        self.threads.append(thread)
+
+  def _worker(self):
+    with self.cond:
+      while not self.stopped:
+        if len(self.tasks) == 0:
+          self.cond.wait()
+
+        if len(self.tasks) == 0: continue
+        if self.stopped: break
+
+        task, args = self.tasks.pop()
+
+        try:
+          self.cond.release()
+          result = task(args)
+        except:
+          self.cond.acquire()
+          self.unfinished = self.unfinished - 1
+          if self.unfinished == 0: self.all_tasks_done.set()
+          raise
+
+        self.cond.acquire()
+        self.results.append(result)
+        self.unfinished = self.unfinished - 1
+        if self.unfinished == 0: self.all_tasks_done.set()
+
+  def add_task(self, task, args = ()):
+    with self.cond:
+      self.tasks.append((task, args))
+      self.unfinished = self.unfinished + 1
+      self.all_tasks_done.clear()
+      self.cond.notify()
+
+  def get_results(self):
+    self.all_tasks_done.wait()
+    with self.cond:
+      return list(self.results)
+
+  def stop(self):
+    self.all_tasks_done.wait()
+
+    with self.cond:
+      self.stopped = True
+      self.cond.notify_all()
+
+    for thread in self.threads:
+      thread.join()
+    self.threads = []
+
 
 def print_help():
   print """Usage: ipm [-c CONFIG] ACTION [IF | --all]
@@ -447,21 +647,31 @@ else:
 
 ipm = IPM(conf)
 
-if options.all:
-  if action == 'up': r = ipm.up_all()
-  elif action == 'down': r = ipm.down_all()
-  elif action == 'reload': r = ipm.reload_all()
-  elif action == 'update': r = ipm.update_all()
-  elif action == 'status': r = ipm.status_all()
-  elif action == 'zap': r = ipm.zap_all()
-  sys.exit(not r)
-  
+with ipm.filelock:
+  if options.all:
+    if action == 'up': r, bufdata = ipm.up_all()
+    elif action == 'down': r, bufdata = ipm.down_all()
+    elif action == 'reload': r, bufdata = ipm.reload_all()
+    elif action == 'update': r, bufdata = ipm.update_all()
+    elif action == 'status': r, bufdata = ipm.status_all()
+    elif action == 'zap': r, bufdata = ipm.zap_all()
+  else:
+    if action == 'up': r, bufdata = ipm.up(dev)
+    elif action == 'down': r, bufdata = ipm.down(dev)
+    elif action == 'reload': r, bufdata = ipm.reload(dev)
+    elif action == 'update': r, bufdata = ipm.update(dev)
+    elif action == 'status': r, bufdata = ipm.status(dev)
+    elif action == 'zap': r, bufdata = ipm.zap(dev)
+
+bufdata = bufdata.strip()
+if len(bufdata):
+  print bufdata
+  print
+
+if r:
+  print 'Command result: Success'
 else:
-  if action == 'up': r = ipm.up(dev)
-  elif action == 'down': r = ipm.down(dev)
-  elif action == 'reload': r = ipm.reload(dev)
-  elif action == 'update': r = ipm.update(dev)
-  elif action == 'status': r = ipm.status(dev)
-  elif action == 'zap': r = ipm.zap(dev)
-  sys.exit(not r)
+  print 'Command result: Failed'
+
+sys.exit(not r)
 
