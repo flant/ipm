@@ -1,11 +1,33 @@
 #!/usr/bin/python
-
-#
-# Copyright (C) 2009-2011 CJSC TrueOffice (www.trueoffice.ru)
-# Written by Dmitry Stolyarov <dmitry.stolyarov@trueoffice.ru>
-#
-
 # -*- coding: utf-8 -*-
+#
+#       ipm (IP Manager) is a simple tool for managing network
+#       interfaces (IP addresses and routing) in GNU/Linux.
+#       Home page: http://flant.ru/projects/ipm
+#       
+#       Copyright (C) 2009-2013 CJSC Flant (www.flant.ru)
+#       Written by Dmitry Stolyarov <dmitry.stolyarov@flant.ru>
+#       
+#       This program is free software; you can redistribute it and/or modify
+#       it under the terms of the GNU General Public License as published by
+#       the Free Software Foundation; either version 2 of the License, or
+#       any later version.
+#       
+#       This program is distributed in the hope that it will be useful,
+#       but WITHOUT ANY WARRANTY; without even the implied warranty of
+#       MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#       GNU General Public License for more details.
+#       
+#       You should have received a copy of the GNU General Public License
+#       along with this program; if not, write to the Free Software
+#       Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+#       MA 02110-1301, USA.
+
+#
+# Copyright (C) 2009-2013 CJSC Flant (www.flant.ru)
+# Written by Dmitry Stolyarov <dmitry.stolyarov@flant.ru>
+#
+
 
 import yaml, os, sys, subprocess, re, Queue, threading
 from optparse import OptionParser
@@ -22,39 +44,39 @@ class IPM:
       sys.exit(1)
  
     if not os.path.isfile(filename):
-      print 'Error: Bad conf file "%s": No such file' % filename
+      print 'Error: Bad configuration file "%s": No such file' % filename
       sys.exit(1)
 
     with file(filename, 'r') as stream:
       try:
         self.data = yaml.load(stream)
       except yaml.YAMLError, exc:
-        print ('Error: Bad conf file "%s": Failed to parse:' % filename), exc
+        print ('Error: Bad configuration file "%s": Failed to parse' % filename), exc
         sys.exit(1)
 
     # base check
     if not isinstance(self.data, dict):
-      print 'Error: Bad conf file "%s": Bad structure' % filename
+      print 'Error: Bad configuration file "%s": Bad structure' % filename
       sys.exit(1)
 
     # config section and state_dir param
     if not self.data.has_key('config') or not isinstance(self.data['config'], dict):
-      print 'Error: Bad conf file "%s": No "config" section' % filename
+      print 'Error: Bad configuration file "%s": No "config" section' % filename
       sys.exit(1)
     if not self.data['config'].has_key('state_dir'):
-      print 'Error: Bad conf file "%s": No "state_dir" param' % filename
+      print 'Error: Bad configuration file "%s": No "state_dir" param' % filename
       sys.exit(1)
     if not os.path.isdir(self.data['config']['state_dir']):
       try:
         os.makedirs(self.data['config']['state_dir'], 0755)
       except:
-        print 'Error: State dir does not exist and mkdir failed'
+        print 'Error: State dir: No such directory, mkdir failed'
         sys.exit(1)
 
     # check interfaces
     for dev, if_conf in self.data['interfaces'].items():
       if not isinstance(if_conf, dict):
-        print 'Error: Bad conf file "%s": Bad config for interface "%s", ignoring them' % (filename, dev)
+        print 'Error: Bad configuration file "%s": Bad config for interface "%s", ignoring' % (filename, dev)
         self.data['interfaces'].pop(dev)
         continue
 
@@ -67,17 +89,17 @@ class IPM:
           self.data['interfaces'][dev].pop(objtype)
           continue
         if not isinstance(items, list):
-          print 'Error: Bad conf file "%s": Bad config for interface "%s": Bad config for objtype "%s", ignoring them' % (filename, dev, objtype)
+          print 'Error: Bad configuration file "%s": Bad config for interface "%s": Bad config for objtype "%s", ignoring' % (filename, dev, objtype)
           self.data['interfaces'][dev].pop(objtype)
           continue
 
         for item in items:
           if not isinstance(item, str):
-            print 'Error: Bad conf file "%s": Bad config for interface "%s": Bad config for objtype "%s": One of the items is bad, ignoring them' % (filename, dev, objtype)
+            print 'Error: Bad configuration file "%s": Bad config for interface "%s": Bad config for objtype "%s": One item is bad, ignoring' % (filename, dev, objtype)
             self.data['interfaces'][dev][objtype].remove(item)
             continue
           if objtype == 'addr' and self._extract_addr(item) == False:
-            print 'Error: Bad conf file "%s": Bad config for interface "%s": Bad config for objtype "%s": Failed to extract addr from item "%s", ignoring them' % (filename, dev, objtype, item)
+            print 'Error: Bad configuration file "%s": Bad config for interface "%s": Bad config for objtype "%s": Failed to extract addr from item "%s", ignoring' % (filename, dev, objtype, item)
             self.data['interfaces'][dev][objtype].remove(item)
             continue
 
@@ -107,7 +129,7 @@ class IPM:
 
     if_conf = self._if_conf(dev)
     if not if_conf:
-      print >> buf, ' = Error: No such interface (in conf file)'
+      print >> buf, ' = Error: No such interface (in configuration file)'
       return False, buf.data()
 
     r, ok_objtypes = self._do(dev, 'add', if_conf)
@@ -177,7 +199,7 @@ class IPM:
     if not if_conf:
       if not len(if_state):
         print >> buf
-        print >> buf, ' = Error: No such interface (both in conf and in state)'
+        print >> buf, ' = Error: No such interface (both in configuration and in state)'
         return False, buf.data()
       if_conf = {}
 
@@ -378,7 +400,7 @@ class IPM:
       try:
         if_state = yaml.load(stream)
       except:
-        print >> buf, 'Error: Bad state file "%s", removing them' % self._if_state_filename(dev)
+        print >> buf, 'Error: Bad state file "%s", removing' % self._if_state_filename(dev)
         os.unlink(self._if_state_filename(dev))
         return False
 
@@ -589,11 +611,14 @@ class IMP_Taskman:
 def print_help():
   print """Usage: ipm [-c CONFIG] ACTION [IF | --all]
 
-Do action for one interface:
+ipm is a simple tool for managing network interfaces
+in GNU/Linux.
+
+Perform an action for one interface:
  ipm [-c CONFIG] ACTION IF
  ipm [-c CONFIG] IF ACTION
   
-Do action for all interfaces:
+Perform an action for all interfaces:
  ipm [-c CONFIG] ACTION --all
 
 Show status for one or all interfaces:
@@ -604,11 +629,13 @@ IF: NIC interface name (eth0, valn5, ...)
 
 ACTIONs: up, down, reload, update, status, zap
 
-CONF (one of):
- full path to conf file or
+CONFIG:
+ full path to configuration file OR
  file in /etc/ipm (with or without extension)
 
-Copyright (C) 2009-2011 CJSC TrueOffice (www.trueoffice.ru)
+
+Home page: http://flant.ru/projects/ipm
+GitHub: https://github.com/flant/ipm
 """
 
 actions = ['up', 'down', 'reload', 'update', 'status', 'zap']
@@ -620,7 +647,7 @@ parser.add_option('-c', '--config', default='main')
 
 options, args = parser.parse_args()
 
-if os.geteuid() != 0: parser.error('you should be root')
+if os.geteuid() != 0: parser.error('you should be root to run this program')
 
 if options.all:
   if len(args) == 0: parser.error('no action given')
@@ -628,7 +655,7 @@ if options.all:
   action = args[0]
   if not action in actions: parser.error('unknown action')  
 else:
-  if len(args) < 2: parser.error('no action and/or iface given')
+  if len(args) < 2: parser.error('no action and/or interface given')
   elif len(args) > 2: parser.error('to many args')
   action, dev = args[0], args[1]
   if dev in actions: action, dev = dev, action
@@ -671,7 +698,6 @@ if len(bufdata):
 if r:
   print 'Command result: Success'
 else:
-  print 'Command result: Failed'
+  print 'Command result: Fail'
 
 sys.exit(not r)
-

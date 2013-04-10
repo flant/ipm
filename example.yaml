@@ -1,5 +1,5 @@
 config:
-  state_dir: /tmp/imp_example
+  state_dir: /tmp/ipm_example
   concurrency: 4
 
 interfaces:
