@@ -1,0 +1,12 @@
+ipm stands for IP Manager (http://flant.ru/projects/ipm)
+
+ipm (IP Manager) is a simple tool on Python used for managing
+network interfaces (IP addresses and routing) in GNU/Linux.
+
+ipm was created for routers operating a lot of IP addresses.
+After configuring network interfaces in a simple YAML file,
+these settings can be applied (added/removed/updated) with
+ipm.
+
+Being multithreaded, ipm can configure hundreds of IP addresses
+in a few seconds.
